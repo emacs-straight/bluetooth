@@ -1,14 +1,14 @@
 ;;; bluetooth.el --- A Major mode for Bluetooth devices -*- lexical-binding: t -*-
 
-;; Copyright (C) 2019, 2020 Free Software Foundation, Inc.
+;; Copyright (C) 2019, 2020, 2022 Free Software Foundation, Inc.
 
 ;; Author: Raffael Stocker <r.stocker@mnet-mail.de>
 ;;         Etienne Prud’homme <e.e.f.prudhomme@gmail.com>
 ;;
 ;; Maintainer: Raffael Stocker <r.stocker@mnet-mail.de>
 ;; Created: 13 Aug 2019
-;; Version: 0.2
-;; Package-Requires: ((emacs "25.1") (dash "2.12.0"))
+;; Version: 0.3
+;; Package-Requires: ((emacs "25.1") (dash "2.18.1"))
 ;; Keywords: hardware
 ;; URL: https://gitlab.com/rstocker/emacs-bluetooth
 
@@ -58,6 +58,10 @@ This is usually `:system' if bluetoothd runs as a system service, or
 `:session' if it runs as a user service."
   :type '(symbol))
 
+(defcustom bluetooth-update-interval 2
+  "Update interval of the device list view."
+  :type '(natnum))
+
 (defgroup bluetooth-faces nil
   "Faces used by Bluetooth mode."
   :group 'faces)
@@ -76,6 +80,9 @@ This is usually `:system' if bluetoothd runs as a system service, or
 (defconst bluetooth-buffer-name "*Bluetooth*"
   "Name of the buffer in which to list bluetooth devices.")
 
+(defconst bluetooth-info-buffer-name "*Bluetooth info*"
+  "Name of the bluetooth info buffer.")
+
 (defconst bluetooth--mode-name "Bluetooth" "Pretty print mode name.")
 
 (defvar bluetooth--mode-info
@@ -84,15 +91,33 @@ This is usually `:system' if bluetoothd runs as a system service, or
 
 (put 'bluetooth--mode-info 'risky-local-variable t)
 
-(defvar bluetooth--mode-state '(("Powered" . (nil nil "off"))
-								("Discoverable" . (nil "discoverable" nil))
-								("Pairable" . (nil "pairable" nil))
-								("Discovering" . (nil "scan" nil)))
+(cl-defstruct bluetooth-property
+  "Bluetooth state information for the mode line with texts shown
+in active and inactive state of a property."
+  active-p
+  (active-text nil :read-only t)
+  (inactive-text nil :read-only t))
+
+(defun bluetooth-property-text (property)
+  "Return the text describing the state of PROPERTY."
+  (if (bluetooth-property-active-p property)
+	  (bluetooth-property-active-text property)
+	(bluetooth-property-inactive-text property)))
+
+(defvar bluetooth--mode-state `(("Powered" . ,(make-bluetooth-property
+											   :inactive-text "off"))
+								("Discoverable" . ,(make-bluetooth-property
+													:active-text "discoverable"))
+								("Pairable" . ,(make-bluetooth-property
+												:active-text "pairable"))
+								("Discovering" . ,(make-bluetooth-property
+												   :active-text "scan")))
   "Mode line adapter state information.
 
 The state information list defines the kind of adapter state
 displayed in the mode-line.  The first element of each sub-list
-is an adapter property, the second is a list containing the
+is an adapter property, the second is a ‘bluetooth-property’
+structure containing the
  - current status of the item (t or nil),
  - string displayed if the property is non-nil,
  - string displayed if the property is nil.
@@ -127,285 +152,193 @@ property and state.")
 	(:properties . "org.freedesktop.DBus.Properties"))
   "Bluez D-Bus interfaces.")
 
-;; Default timeout for D-Bus commands
 (defvar bluetooth--timeout 5000 "Default timeout for Bluez D-Bus access.")
 
-;; This variable holds the device information as obtained from D-Bus.
 (defvar bluetooth--device-info nil "Device info obtained from Bluez.")
 
-
-;;;; command definitions
-
-(eval-and-compile
-  (defun bluetooth--function-name (name &optional prefix)
-	"Make a function name out of NAME and PREFIX.
-The generated function name has the form `bluetoothPREFIX-NAME'."
-	(let ((case-fold-search nil))
-	  (concat "bluetooth"
-			  prefix
-			  (replace-regexp-in-string "[[:upper:]][[:lower:]]+"
-										(lambda (x) (concat "-" (downcase x)))
-										name t)))))
-
-(defun bluetooth--choose-uuid ()
-  "Ask for a UUID and return it in a form suitable for ‘interactive’."
-  (if current-prefix-arg
-	  (let* ((dev-id (tabulated-list-get-id))
-			 (uuids (bluetooth--device-uuids
-					 (bluetooth--device-properties dev-id)))
-			 (profile (completing-read "Profile: "
-									   (mapcar (lambda (x)
-												 (concat (caadr x)
-														 ", "
-														 (cadadr x)))
-											   uuids)
-									   nil t)))
-		(list (cl-rassoc profile uuids
-						 :key (lambda (x)
-								(concat (caar x) ", " (cadar x)))
-						 :test #'string=)))
-	'(nil)))
-
-(defun bluetooth-connect (uuid)
-  "Connect to the Bluetooth device at point.
-When called with a prefix argument, ask for a profile and
-connect only this profile.  Otherwise, or when called
-non-interactively with UUID set to nil, connect to all profiles."
-  (interactive (bluetooth--choose-uuid))
-  (if uuid
-	  (bluetooth--dbus-method "ConnectProfile" :device (car uuid))
-	(bluetooth--dbus-method "Connect" :device)))
-
-(defun bluetooth-disconnect (uuid)
-  "Disconnect the Bluetooth device at point.
-When called with a prefix argument, ask for a profile and
-disconnect only this profile.  Otherwise, or when called
-non-interactively with UUID set to nil, disconnect all
-profiles."
-  (interactive (bluetooth--choose-uuid))
-  (if uuid
-	  (bluetooth--dbus-method "DisconnectProfile" :device (car uuid))
-	(bluetooth--dbus-method "Disconnect" :device)))
-
-(defun bluetooth-connect-profile ()
-  "Ask for a Bluetooth profile and connect the device at point to it."
-  (interactive)
-  (let ((prefix-arg (list 4)))
-	(command-execute #'bluetooth-connect)))
-
-(defun bluetooth-disconnect-profile ()
-  "Ask for a Bluetooth profile and disconnect the device at point from it."
-  (interactive)
-  (let ((prefix-arg (list 4)))
-	(command-execute #'bluetooth-disconnect)))
-
-
-(defmacro bluetooth-defun-method (method api docstring)
-  (declare (doc-string 3) (indent 2))
-  (let ((name (bluetooth--function-name method)))
-	`(defun ,(intern name) () ,docstring
-			(interactive)
-			(bluetooth--dbus-method ,method ,api))))
-
-(bluetooth-defun-method "StartDiscovery" :adapter
-  "Start discovery mode.")
-(bluetooth-defun-method "StopDiscovery" :adapter
-  "Stop discovery mode.")
-(bluetooth-defun-method "Pair" :device
-  "Pair with device at point.")
-
-(defmacro bluetooth-defun-toggle (property api docstring)
-  (declare (doc-string 3) (indent 2))
-  (let ((name (bluetooth--function-name property "-toggle")))
-	`(defun ,(intern name) () ,docstring
-			(interactive)
-			(bluetooth--dbus-toggle ,property ,api))))
-
-(bluetooth-defun-toggle "Blocked" :device
-  "Mark Bluetooth device at point blocked.")
-(bluetooth-defun-toggle "Trusted" :device
-  "Mark Bluetooth device at point trusted.")
-(bluetooth-defun-toggle "Powered" :adapter
-  "Toggle power supply of adapter.")
-(bluetooth-defun-toggle "Discoverable" :adapter
-  "Toggle discoverable mode.")
-(bluetooth-defun-toggle "Pairable" :adapter
-  "Toggle pairable mode.")
-
-(defun bluetooth-set-alias (name)
-  "Set alias of Bluetooth device at point to NAME."
-  (interactive "MAlias (empty to reset): ")
-  (bluetooth--dbus-set "Alias" name :device))
-
-(defun bluetooth-end-of-list ()
-  "Move cursor to the last list element."
-  (interactive)
-  (let ((column (current-column)))
-	(goto-char (point-max))
-	(forward-line -1)
-	(goto-char (+ (point)
-				  (- column (current-column))))))
-
-(defun bluetooth-beginning-of-list ()
-  "Move cursor to the first list element."
-  (interactive)
-  (let ((column (current-column)))
-	(goto-char (point-min))
-	(goto-char (+ (point)
-				  (- column (current-column))))))
-
-
-;;;; keymap and menu
-
-(defvar bluetooth-mode-map
-  (let ((map (make-sparse-keymap)))
-	(set-keymap-parent map tabulated-list-mode-map)
-	(define-key map [?c] #'bluetooth-connect)
-	(define-key map [?d] #'bluetooth-disconnect)
-	(define-key map [?b] #'bluetooth-toggle-blocked)
-	(define-key map [?t] #'bluetooth-toggle-trusted)
-	(define-key map [?a] #'bluetooth-set-alias)
-	(define-key map [?r] #'bluetooth-start-discovery)
-	(define-key map [?R] #'bluetooth-stop-discovery)
-	(define-key map [?s] #'bluetooth-toggle-powered)
-	(define-key map [?P] #'bluetooth-pair)
-	(define-key map [?D] #'bluetooth-toggle-discoverable)
-	(define-key map [?x] #'bluetooth-toggle-pairable)
-	(define-key map [?i] #'bluetooth-show-device-info)
-	(define-key map [?k] #'bluetooth-remove-device)
-	(define-key map [?<] #'bluetooth-beginning-of-list)
-	(define-key map [?>] #'bluetooth-end-of-list)
-
-	(define-key map [menu-bar bluetooth]
-	  (cons "Bluetooth" (make-sparse-keymap "Bluetooth")))
-	(define-key map [menu-bar bluetooth device]
-	  (cons "Device" (make-sparse-keymap "Device")))
-
-	(define-key map [menu-bar bluetooth stop-discovery]
-	  '(menu-item "Stop discovery" bluetooth-stop-discovery
-				  :help "Stop discovery"))
-	(define-key map [menu-bar bluetooth start-discovery]
-	  '(menu-item "Start discovery" bluetooth-start-discovery
-				  :help "Start discovery"))
-	(define-key map [menu-bar bluetooth toggle-discoverable]
-	  '(menu-item "Toggle discoverable" bluetooth-toggle-discoverable
-				  :help "Toggle discoverable mode"))
-	(define-key map [menu-bar bluetooth toggle-pairable]
-	  '(menu-item "Toggle pairable" bluetooth-toggle-pairable
-				  :help "Toggle pairable mode"))
-	(define-key map [menu-bar bluetooth toggle-powered]
-	  '(menu-item "Toggle powered" bluetooth-toggle-powered
-				  :help "Toggle power supply of adapter"))
-
-	(define-key map [menu-bar bluetooth device show-info]
-	  '(menu-item "Show device info" bluetooth-show-device-info
-				  :help "Show bluetooth device info"))
-	(define-key map [menu-bar bluetooth device set-alias]
-	  '(menu-item "Set device alias" bluetooth-set-alias
-				  :help "Set device alias"))
-	(define-key map [menu-bar bluetooth device toggle-trusted]
-	  '(menu-item "Toggle trusted" bluetooth-toggle-trusted
-				  :help "Trust/untrust bluetooth device"))
-	(define-key map [menu-bar bluetooth device toggle-blocked]
-	  '(menu-item "Toggle blocked" bluetooth-toggle-blocked
-				  :help "Block/unblock bluetooth device"))
-	(define-key map [menu-bar bluetooth device disconnect-profile]
-	  '(menu-item "Disconnect profile" bluetooth-disconnect-profile
-				  :help "Disconnect bluetooth device profile"))
-	(define-key map [menu-bar bluetooth device disconnect]
-	  '(menu-item "Disconnect" bluetooth-disconnect
-				  :help "Disconnect bluetooth device"))
-	(define-key map [menu-bar bluetooth device connect-profile]
-	  '(menu-item "Connect profile" bluetooth-connect-profile
-				  :help "Connect bluetooth device profile"))
-	(define-key map [menu-bar bluetooth device connect]
-	  '(menu-item "Connect" bluetooth-connect
-				  :help "Connect bluetooth device"))
-	(define-key map [menu-bar bluetooth device remove]
-	  '(menu-item "Remove" bluetooth-remove-device
-				  :help "Remove bluetooth device"))
-	(define-key map [menu-bar bluetooth device pair]
-	  '(menu-item "Pair" bluetooth-pair
-				  :help "Pair bluetooth device"))
-
-	map)
-  "The Bluetooth mode keymap.")
+(defvar bluetooth--update-timer nil
+  "The bluetooth device table update timer.")
 
 
 ;;;; internal functions
 
-;; This function returns a list of bluetooth adapters and devices
-;; in the form
-;; (("hci0"
-;;   ("dev_78_AB_BB_DA_6C_7E" "dev_90_F1_AA_06_24_72")))
-;;
-;; The first element of each (sub-) list is an adapter name, followed
-;; by a list of devices known to this adapter.
-(defun bluetooth--get-devices ()
-  "Return a list of bluetooth adapters and devices connected to them."
-  (mapcar (lambda (a)
-			(list a (dbus-introspect-get-node-names
-					 bluetooth-bluez-bus bluetooth--service
-					 (concat bluetooth--root "/" a))))
-		  (dbus-introspect-get-node-names
-		   bluetooth-bluez-bus bluetooth--service bluetooth--root)))
+(cl-defstruct bluetooth-device
+  "A bluetooth device.  This structure holds all the device
+properties."
+  (id nil :read-only t)
+  signal-handler
+  properties)
 
-(defun bluetooth--dev-state (key device)
+(defun bluetooth-device-property (device property)
+  "Return DEVICE's property PROPERTY."
+  (alist-get property
+			 (bluetooth-device-properties device)
+			 nil nil #'equal))
+
+(defun bluetooth-device-property-set (device property value)
+  "Set DEVICE's PROPERTY to VALUE."
+  (setf (alist-get property (bluetooth-device-properties device)
+				   nil nil #'equal)
+		value))
+
+(gv-define-simple-setter bluetooth-device-property
+						 bluetooth-device-property-set)
+
+(defun bluetooth--query-adapters ()
+  "Return a list of bluetooth adapters."
+  (dbus-introspect-get-node-names
+   bluetooth-bluez-bus bluetooth--service bluetooth--root))
+
+(defun bluetooth--query-devices (adapter)
+  "Return a list of bluetooth devices connected to ADAPTER."
+  (dbus-introspect-get-node-names bluetooth-bluez-bus bluetooth--service
+								  (concat bluetooth--root "/" adapter)))
+
+(defun bluetooth--device (device-id)
+  "Return the device struct for DEVICE-ID."
+  (gethash device-id bluetooth--device-info))
+
+(defun bluetooth--device-state (key device)
   "Return state information regarding KEY for DEVICE."
-  (let ((value (cdr (assoc key (cadr device)))))
+  (let ((value (bluetooth-device-property device key)))
 	(cond ((stringp value) value)
 		  ((null value) "no")
 		  (t "yes"))))
 
+(defun bluetooth--make-signal-handler (device)
+  (let ((adapter (bluetooth-device-property device "Adapter"))
+		(dev-id (bluetooth-device-id device)))
+	(cl-flet ((handler
+			   (_interface changed-props invalidated-props)
+			   (let ((device (bluetooth--device dev-id)))
+				 (mapc (lambda (prop)
+						 (cl-destructuring-bind (key (value)) prop
+							 (setf (bluetooth-device-property device key)
+								   value)))
+					   (append changed-props invalidated-props))
+				 (bluetooth--print-list))))
+	  (dbus-register-signal bluetooth-bluez-bus bluetooth--service
+							(concat adapter "/" dev-id)
+							(alist-get :properties bluetooth--interfaces)
+							"PropertiesChanged"
+							#'handler
+							:arg-namespace
+							(alist-get :device bluetooth--interfaces)))))
+
+(defun bluetooth--device-create (adapter dev-id)
+  "Create a bluetooth device struct for DEV-ID on ADAPTER."
+  (let* ((path (mapconcat #'identity
+						  (list bluetooth--root adapter dev-id)
+						  "/"))
+		 (props (dbus-get-all-properties bluetooth-bluez-bus
+										 bluetooth--service
+										 path
+										 (alist-get
+										  :device bluetooth--interfaces))))
+	(make-bluetooth-device :id dev-id
+						   :signal-handler nil
+						   :properties props)))
+
+(defun bluetooth--device-remove (dev-id)
+  "Remove the device with id DEV-ID from the device info."
+  (let ((device (bluetooth--device dev-id)))
+	(when (bluetooth-device-signal-handler device)
+	  (dbus-unregister-object (bluetooth-device-signal-handler device))
+	  (setf (bluetooth-device-signal-handler device) nil)))
+  (remhash dev-id bluetooth--device-info))
+
+(defun bluetooth--device-add (dev-id device)
+  "Add bluetooth DEVICE with id DEV-ID to device info."
+  (when (bluetooth-device-property device "Paired")
+		(setf (bluetooth-device-signal-handler device)
+			  (bluetooth--make-signal-handler device)))
+  (puthash dev-id device bluetooth--device-info))
+
+(defun bluetooth--device-update (dev-id device)
+  "Update device info for id DEV-ID with data in DEVICE."
+  (setf (bluetooth-device-properties (bluetooth--device dev-id))
+		(bluetooth-device-properties device))
+  (when (and (bluetooth-device-property device "Paired")
+			 (null (bluetooth-device-signal-handler device)))
+		(setf (bluetooth-device-signal-handler device)
+			  (bluetooth--make-signal-handler device))))
+
+(defun bluetooth--adapter-properties (adapter)
+  "Return the properties of bluetooth ADAPTER.
+This function evaluates to an alist of attribute/value pairs."
+  (dbus-get-all-properties bluetooth-bluez-bus bluetooth--service
+						   (concat bluetooth--root "/" adapter)
+						   (alist-get :adapter
+									  bluetooth--interfaces)))
+
 (defconst bluetooth--list-format
-  [("Alias" 24 t) ("Paired" 8 t) ("Connected" 11 t) ("Address" 17 t)
+  [("Alias" 24 t) ("Paired" 8 t) ("Connected" 11 t) ("Address" 18 t)
    ("Blocked" 9 t) ("Trusted" 9 t)]
   "The list view format for bluetooth mode.
 
 NOTE: the strings MUST correspond to Bluez device properties
 as they are used to gather the information from Bluez.")
 
+(defun bluetooth--initialize-device-info ()
+  "Initialize bluetooth device info.  Call only once."
+  (mapc (lambda (adapter)
+		  (mapc (lambda (dev-id)
+				  (bluetooth--device-add dev-id
+										 (bluetooth--device-create adapter
+																   dev-id)))
+				(bluetooth--query-devices adapter)))
+		(bluetooth--query-adapters)))
+
+(defun bluetooth--update-device-info (adapter)
+  "Update the bluetooth devices list for ADAPTER."
+  (let ((queried-devices (bluetooth--query-devices adapter)))
+	(let ((removed-devices (cl-set-difference (hash-table-keys
+											   bluetooth--device-info)
+											  queried-devices)))
+	  (mapc (lambda (dev-id)
+			  (bluetooth--device-remove dev-id))
+			removed-devices)
+	  (mapc (lambda (dev-id)
+			  (if-let (device (bluetooth--device dev-id))
+				  (bluetooth--device-update dev-id device)
+				(bluetooth--device-add dev-id
+									   (bluetooth--device-create adapter
+																 dev-id))))
+			queried-devices))))
+
+(defun bluetooth--update-all ()
+  "Update the device info for all adapters."
+  (mapc #'bluetooth--update-device-info
+		(bluetooth--query-adapters)))
+
 ;; This function provides the list entries for the tabulated-list
 ;; view.  It is called from `tabulated-list-print'.
 (defun bluetooth--list-entries ()
   "Provide the list entries for the tabulated view."
-  (setq bluetooth--device-info
-		(mapcan
-		 (lambda (devlist)
-		   (cl-loop for dev in (cadr devlist)
-					for path = (mapconcat #'identity
-										  (list bluetooth--root (car devlist) dev)
-										  "/")
-					collect (cons dev (list (dbus-get-all-properties
-											 bluetooth-bluez-bus
-											 bluetooth--service path
-											 (alist-get :device
-														bluetooth--interfaces))))))
-		 (bluetooth--get-devices)))
-  (mapcar (lambda (dev)
-			(list (car dev)
-				  (cl-map 'vector (lambda (key) (bluetooth--dev-state key dev))
-						  (mapcar #'car bluetooth--list-format))))
-		  bluetooth--device-info))
+  (let (dev-list)
+	(maphash (lambda (dev-id device)
+			   (when (bluetooth-device-properties device)
+				 (push (list dev-id
+							 (cl-map 'vector (lambda (key)
+											   (bluetooth--device-state key device))
+									 (mapcar #'cl-first bluetooth--list-format)))
+					   dev-list)))
+			 bluetooth--device-info)
+	dev-list))
 
-(defun bluetooth--update-list ()
-  "Update the list view."
+(defun bluetooth--print-list ()
+  "Print the device list."
   (with-current-buffer bluetooth-buffer-name
 	(tabulated-list-print t)
 	(and (fboundp 'hl-line-highlight)
 		 (bound-and-true-p hl-line-mode)
 		 (hl-line-highlight))))
 
-(define-derived-mode bluetooth-mode tabulated-list-mode
-  bluetooth--mode-name
-  "Major mode for managing Bluetooth devices."
-  (setq tabulated-list-format bluetooth--list-format
-		tabulated-list-entries #'bluetooth--list-entries
-		tabulated-list-padding 1
-		tabulated-list-sort-key (cons "Alias" nil))
-  (tabulated-list-init-header)
-  (tabulated-list-print)
-  (hl-line-mode))
+(defun bluetooth--update-print ()
+  "Update device info and print device list view."
+  (ignore-errors
+	(bluetooth--update-all)
+	(bluetooth--print-list)))
 
 ;; Build up the index for Imenu.  This function is used as
 ;; `imenu-create-index-function'.
@@ -421,30 +354,30 @@ as they are used to gather the information from Bluez.")
   "For DEV-ID, invoke D-Bus FUNCTION on API, passing ARGS."
   (let ((path (cond ((and (eq :device api)
 						  (not (null dev-id)))
-					 (concat (bluetooth--dev-state
-							  "Adapter"
-							  (assoc dev-id bluetooth--device-info))
+					 (concat (bluetooth-device-property
+							  (bluetooth--device dev-id)
+							  "Adapter")
 							 "/" dev-id))
 					((eq :adapter api)
 					 (concat bluetooth--root
 							 "/"
-							 (caar (bluetooth--get-devices))))
+							 (cl-first (bluetooth--query-adapters))))
 					(t nil)))
 		(interface (alist-get api bluetooth--interfaces)))
 	(when path
 	  (apply function bluetooth-bluez-bus bluetooth--service path interface
-			 (mapcar (lambda (x) (if (eq x :path-devid) (concat path "/" dev-id) x))
+			 (mapcar (lambda (x)
+					   (if (eq x :path-devid)
+						   (concat path "/" dev-id)
+						 x))
 					 args)))))
-
-;; The following functions are the workers for the commands.
-;; They are used by `bluetooth--make-commands'.
 
 (defun bluetooth--dbus-method (method api &rest args)
   "Invoke METHOD on D-Bus API with ARGS."
   (let ((dev-id (tabulated-list-get-id)))
 	(apply #'bluetooth--call-method dev-id api
 		   #'dbus-call-method-asynchronously method
-		   #'bluetooth--update-list :timeout bluetooth--timeout args)))
+		   nil :timeout bluetooth--timeout args)))
 
 (defun bluetooth--dbus-toggle (property api)
   "Toggle boolean PROPERTY on D-Bus API."
@@ -452,30 +385,21 @@ as they are used to gather the information from Bluez.")
 		 (value (bluetooth--call-method dev-id api
 										#'dbus-get-property property)))
 	(bluetooth--call-method dev-id api #'dbus-set-property property
-							(not value))
-	(bluetooth--update-list)))
+							(not value))))
 
 (defun bluetooth--dbus-set (property arg api)
   "Set PROPERTY to ARG on D-Bus API."
   (let ((dev-id (tabulated-list-get-id)))
-	(bluetooth--call-method dev-id api #'dbus-set-property property arg)
-	(bluetooth--update-list)))
-
-;; end of worker function definitions
+	(bluetooth--call-method dev-id api #'dbus-set-property property arg)))
 
 (defun bluetooth--initialize-mode-info ()
   "Get the current adapter state and display it.
 This function only uses the first adapter reported by Bluez."
-  (let* ((adapters (dbus-introspect-get-node-names
-					bluetooth-bluez-bus bluetooth--service bluetooth--root))
-		 (resp (dbus-get-all-properties bluetooth-bluez-bus bluetooth--service
-										(concat bluetooth--root "/"
-												(car adapters))
-										(alist-get :adapter
-												   bluetooth--interfaces)))
-		 (info (mapcar (lambda (elt)
-						 (list (car elt) (list (cdr (assoc (car elt) resp)))))
-					   bluetooth--mode-state)))
+  (let* ((adapter (cl-first (bluetooth--query-adapters)))
+		 (props (bluetooth--adapter-properties adapter))
+		 (info (--map (list (cl-first it)
+							(list (cl-rest (assoc (cl-first it) props))))
+					  bluetooth--mode-state)))
 	(bluetooth--handle-prop-change (alist-get :adapter bluetooth--interfaces)
 								   info)))
 
@@ -489,35 +413,27 @@ This function only uses the first adapter reported by Bluez."
 					  "UnregisterAgent"
 					  :object-path bluetooth--own-path)
 	(mapc #'dbus-unregister-object bluetooth--method-objects)
-	(dbus-unregister-object bluetooth--adapter-signal)))
+	(dbus-unregister-object bluetooth--adapter-signal)
+	(mapc #'bluetooth--device-remove
+		  (hash-table-keys bluetooth--device-info))
+	(setq bluetooth--device-info nil)
+	(remove-hook tabulated-list-revert-hook #'bluetooth--update-all)
+	(cancel-timer bluetooth--update-timer)))
 
 (defun bluetooth-unload-function ()
   "Clean up when the bluetooth feature is unloaded."
   (when (buffer-live-p (get-buffer bluetooth-buffer-name))
+	(bluetooth--cleanup)
 	(kill-buffer bluetooth-buffer-name))
   nil)
-
-(defun bluetooth-remove-device ()
-  "Remove Bluetooth device at point (unpaires device and host)."
-  (interactive)
-  (let ((dev-id (tabulated-list-get-id)))
-	(when dev-id
-	  (bluetooth--call-method dev-id
-							  :adapter
-							  #'dbus-call-method-asynchronously
-							  "RemoveDevice"
-							  #'bluetooth--update-list
-							  :timeout bluetooth--timeout
-							  :object-path :path-devid))))
 
 ;; This function is called from Emacs's mode-line update code
 ;; and must not contain any calls to D-Bus functions.
 (defun bluetooth--mode-info ()
   "Update the mode info display."
   (let ((info (mapconcat #'identity
-						 (-keep (lambda (x) (if (cadr x)
-										   (caddr x) (cadddr x)))
-								bluetooth--mode-state)
+						 (--keep (bluetooth-property-text (cl-rest it))
+								 bluetooth--mode-state)
 						 ",")))
 	(unless (string-blank-p info)
 	  (concat " [" info "]"))))
@@ -527,38 +443,30 @@ This function only uses the first adapter reported by Bluez."
 Only adapter properties are considered.  If an adapter property changes,
 update the status display accordingly."
   (when (string= interface (alist-get :adapter bluetooth--interfaces))
-	(dolist (elt data)
-	  (let ((prop (car elt))
-			(value (caadr elt)))
-		(when-let (state (cdr (assoc prop bluetooth--mode-state)))
-		  (setcar state value))))))
+	(mapc (lambda (elt)
+			(cl-destructuring-bind (prop (value)) elt
+			  (when-let (property (cl-rest (assoc prop bluetooth--mode-state)))
+				(setf (bluetooth-property-active-p property) value))))
+		  data)
+	(force-mode-line-update)))
 
 (defun bluetooth--register-signal-handler ()
   "Register a signal handler for adapter property changes.
 
 This function registers a signal handler only for the first
 adapter reported by Bluez."
-  (let ((adapters (dbus-introspect-get-node-names bluetooth-bluez-bus
-												  bluetooth--service
-												  bluetooth--root)))
-	(setq bluetooth--adapter-signal
-		  (dbus-register-signal bluetooth-bluez-bus
-								nil
-								(concat bluetooth--root "/"
-										(car adapters))
-								(alist-get :properties
-										   bluetooth--interfaces)
-								"PropertiesChanged"
-								#'bluetooth--handle-prop-change
-								:arg-namespace
-								(alist-get :adapter
-										   bluetooth--interfaces)))))
-
-(defun bluetooth--device-properties (dev-id)
-  "Return all properties of device DEV-ID."
-  (bluetooth--call-method
-   (car (last (split-string dev-id "/"))) :device
-   #'dbus-get-all-properties))
+  (let ((adapter (cl-first (bluetooth--query-adapters))))
+	(dbus-register-signal bluetooth-bluez-bus
+						  nil
+						  (concat bluetooth--root "/"
+								  adapter)
+						  (alist-get :properties
+									 bluetooth--interfaces)
+						  "PropertiesChanged"
+						  #'bluetooth--handle-prop-change
+						  :arg-namespace
+						  (alist-get :adapter
+									 bluetooth--interfaces))))
 
 (defun bluetooth--device-uuids (properties)
   "Extract a UUID alist from device PROPERTIES.
@@ -566,38 +474,15 @@ Each list element contains a UUID as the key and the
 corresponding description string as the value.  If no description
 string is available (e.g. for unknown UUIDs,) the UUID itself is
 the value.  The device properties can be obtained in the suitable
-form by a call to ‘bluetooth--device-properties’."
-  (let ((uuids (cdr (assoc "UUIDs" properties)))
+form by a call to ‘bluetooth-device-properties’."
+  (let ((uuids (cl-rest (assoc "UUIDs" properties)))
 		(uuid-alist))
 	(when uuids
 	  (dolist (id uuids)
 		(let ((desc (or (bluetooth--parse-service-class-uuid id)
 						(list id))))
-		  (push (list id desc) uuid-alist))))
-	(nreverse uuid-alist)))
-
-
-;;;; mode entry command
-
-;;;###autoload
-(defun bluetooth-list-devices ()
-  "Display a list of Bluetooth devices.
-This function starts Bluetooth mode which offers an interface
-offering device management functions, e.g. pairing, connecting,
-scanning the bus, displaying device info etc."
-  (interactive)
-  ;; make sure D-Bus is (made) available
-  (dbus-ping bluetooth-bluez-bus bluetooth--service bluetooth--timeout)
-  (with-current-buffer (switch-to-buffer bluetooth-buffer-name)
-	(unless (derived-mode-p 'bluetooth-mode)
-	  (erase-buffer)
-	  (bluetooth-mode)
-	  (bluetooth--register-agent)
-	  (cl-pushnew bluetooth--mode-info mode-line-process)
-	  (add-hook 'kill-buffer-hook #'bluetooth--cleanup nil t)
-	  (setq imenu-create-index-function #'bluetooth--create-imenu-index)
-	  (bluetooth--initialize-mode-info)
-	  (bluetooth--register-signal-handler))))
+		  (push (list id desc) uuid-alist)))
+	  (nreverse uuid-alist))))
 
 
 ;;;; Bluetooth pairing agent code
@@ -610,10 +495,11 @@ scanning the bus, displaying device info etc."
 (defmacro bluetooth--with-alias (device &rest body)
   "Evaluate BODY with DEVICE alias bound to ALIAS."
   (declare (indent defun))
-  `(let* ((dev (car (last (split-string ,device "/"))))
-		  (alias (or (bluetooth--call-method dev :device
-											 #'dbus-get-property "Alias")
-					 (replace-regexp-in-string "_" ":" dev nil nil nil 4))))
+  `(let* ((dev-id (cl-first (last (split-string ,device "/")))) 
+		  (dev (bluetooth--device dev-id))
+		  (alias (if dev
+					 (bluetooth-device-property dev "Alias")
+				   (replace-regexp-in-string "_" ":" dev-id nil nil nil 4))))
 	 ,@body))
 
 (defmacro bluetooth--maybe-cancel-reject (&rest body)
@@ -702,21 +588,21 @@ scanning the bus, displaying device info etc."
   (let ((methods '("Release" "RequestPinCode" "DisplayPinCode"
 				   "RequestPasskey" "DisplayPasskey" "RequestConfirmation"
 				   "RequestAuthorization" "AuthorizeService" "Cancel")))
-	(setq bluetooth--method-objects
-		  (cl-loop for method in methods
-				   for fname = (bluetooth--function-name method "-")
-				   collect (dbus-register-method bluetooth-bluez-bus
-												 dbus-service-emacs
-												 bluetooth--own-path
-												 (alist-get
-												  :agent
-												  bluetooth--interfaces)
-												 method (intern fname) t))))
-  (dbus-register-service :session dbus-service-emacs)
-  (dbus-call-method bluetooth-bluez-bus bluetooth--service bluetooth--root
-					(alist-get :agent-manager bluetooth--interfaces)
-					"RegisterAgent"
-					:object-path bluetooth--own-path "KeyboardDisplay"))
+	(prog1 
+		(cl-loop for method in methods
+				 for fname = (bluetooth--function-name method "-")
+				 collect (dbus-register-method bluetooth-bluez-bus
+											   dbus-service-emacs
+											   bluetooth--own-path
+											   (alist-get
+												:agent
+												bluetooth--interfaces)
+											   method (intern fname) t))
+	  (dbus-register-service :session dbus-service-emacs)
+	  (dbus-call-method bluetooth-bluez-bus bluetooth--service bluetooth--root
+						(alist-get :agent-manager bluetooth--interfaces)
+						"RegisterAgent"
+						:object-path bluetooth--own-path "KeyboardDisplay"))))
 
 
 ;;;; service and class UUID definitions
@@ -943,7 +829,7 @@ scanning the bus, displaying device info etc."
 
 (defconst bluetooth--service-class-uuids
   #s(hash-table
-	 size 50 data
+	 size 120 data
 	 (#x1000
 	  ("ServiceDiscoveryServerServiceClassID"
 	   "Bluetooth Core Specification")
@@ -1040,80 +926,71 @@ scanning the bus, displaying device info etc."
 (define-obsolete-variable-alias 'bluetooth--gatt-service-uuid-alist
   'bluetooth--gatt-service-uuids "0.2")
 
+;; Last updated: 01. Jan 2022
 (defconst bluetooth--gatt-service-uuids
   #s(hash-table
-	 size 20 data
+	 size 70 data
 	 (#x1800
 	  ("Generic Access" "org.bluetooth.service.generic_access" "GSS")
-	  #x1811 ("Alert Notification Service"
-			  "org.bluetooth.service.alert_notification" "GSS")
-	  #x1815 ("Automation IO" "org.bluetooth.service.automation_io" "GSS")
-	  #x180F ("Battery Service" "org.bluetooth.service.battery_service"
-			  "GSS")
-	  #x183B ("Binary Sensor" "GATT Service UUID" "BSS")
-	  #x1810 ("Blood Pressure" "org.bluetooth.service.blood_pressure" "GSS")
-	  #x181B ("Body Composition" "org.bluetooth.service.body_composition"
-			  "GSS")
-	  #x181E ("Bond Management Service"
-			  "org.bluetooth.service.bond_management" "GSS")
-	  #x181F ("Continuous Glucose Monitoring"
-			  "org.bluetooth.service.continuous_glucose_monitoring" "GSS")
-	  #x1805 ("Current Time Service" "org.bluetooth.service.current_time"
-			  "GSS")
-	  #x1818 ("Cycling Power" "org.bluetooth.service.cycling_power" "GSS")
-	  #x1816 ("Cycling Speed and Cadence"
-			  "org.bluetooth.service.cycling_speed_and_cadence" "GSS")
-	  #x180A ("Device Information" "org.bluetooth.service.device_information"
-			  "GSS")
-	  #x183C ("Emergency Configuration" "GATT Service UUID" "EMCS")
-	  #x181A ("Environmental Sensing"
-			  "org.bluetooth.service.environmental_sensing" "GSS")
-	  #x1826 ("Fitness Machine" "org.bluetooth.service.fitness_machine"
-			  "GSS")
-	  #x1801 ("Generic Attribute" "org.bluetooth.service.generic_attribute"
-			  "GSS")
-	  #x1808 ("Glucose" "org.bluetooth.service.glucose" "GSS")
-	  #x1809 ("Health Thermometer" "org.bluetooth.service.health_thermometer"
-			  "GSS")
-	  #x180D ("Heart Rate" "org.bluetooth.service.heart_rate" "GSS")
-	  #x1823 ("HTTP Proxy" "org.bluetooth.service.http_proxy" "GSS")
-	  #x1812 ("Human Interface Device"
-			  "org.bluetooth.service.human_interface_device" "GSS")
-	  #x1802 ("Immediate Alert" "org.bluetooth.service.immediate_alert"
-			  "GSS")
-	  #x1821 ("Indoor Positioning" "org.bluetooth.service.indoor_positioning"
-			  "GSS")
-	  #x183A ("Insulin Delivery" "org.bluetooth.service.insulin_delivery"
-			  "GSS")
-	  #x1820 ("Internet Protocol Support Service"
-			  "org.bluetooth.service.internet_protocol_support" "GSS")
+	  #x1801 ("Generic Attribute" "org.bluetooth.service.generic_attribute" "GSS")
+	  #x1802 ("Immediate Alert" "org.bluetooth.service.immediate_alert" "GSS")
 	  #x1803 ("Link Loss" "org.bluetooth.service.link_loss" "GSS")
-	  #x1819 ("Location and Navigation"
-			  "org.bluetooth.service.location_and_navigation" "GSS")
-	  #x1827 ("Mesh Provisioning Service"
-			  "org.bluetooth.service.mesh_provisioning" "GSS")
-	  #x1828 ("Mesh Proxy Service" "org.bluetooth.service.mesh_proxy" "GSS")
-	  #x1807 ("Next DST Change Service"
-			  "org.bluetooth.service.next_dst_change" "GSS")
-	  #x1825 ("Object Transfer Service"
-			  "org.bluetooth.service.object_transfer" "GSS")
-	  #x180E ("Phone Alert Status Service"
-			  "org.bluetooth.service.phone_alert_status" "GSS")
-	  #x1822 ("Pulse Oximeter Service" "org.bluetooth.service.pulse_oximeter"
-			  "GSS")
-	  #x1829 ("Reconnection Configuration"
-			  "org.bluetooth.service.reconnection_configuration" "GSS")
-	  #x1806 ("Reference Time Update Service"
-			  "org.bluetooth.service.reference_time_update" "GSS")
-	  #x1814 ("Running Speed and Cadence"
-			  "org.bluetooth.service.running_speed_and_cadence" "GSS")
-	  #x1813 ("Scan Parameters" "org.bluetooth.service.scan_parameters"
-			  "GSS")
-	  #x1824 ("Transport Discovery"
-			  "org.bluetooth.service.transport_discovery" "GSS")
 	  #x1804 ("Tx Power" "org.bluetooth.service.tx_power" "GSS")
+	  #x1805 ("Current Time Service" "org.bluetooth.service.current_time" "GSS")
+	  #x1806 ("Reference Time Update Service" "org.bluetooth.service.reference_time_update" "GSS")
+	  #x1807 ("Next DST Change Service" "org.bluetooth.service.next_dst_change" "GSS")
+	  #x1808 ("Glucose" "org.bluetooth.service.glucose" "GSS")
+	  #x1809 ("Health Thermometer" "org.bluetooth.service.health_thermometer" "GSS")
+	  #x180A ("Device Information" "org.bluetooth.service.device_information" "GSS")
+	  #x180D ("Heart Rate" "org.bluetooth.service.heart_rate" "GSS")
+	  #x180E ("Phone Alert Status Service" "org.bluetooth.service.phone_alert_status" "GSS")
+	  #x180F ("Battery Service" "org.bluetooth.service.battery_service" "GSS")
+	  #x1810 ("Blood Pressure" "org.bluetooth.service.blood_pressure" "GSS")
+	  #x1811 ("Alert Notification Service" "org.bluetooth.service.alert_notification" "GSS")
+	  #x1812 ("Human Interface Device" "org.bluetooth.service.human_interface_device" "GSS")
+	  #x1813 ("Scan Parameters" "org.bluetooth.service.scan_parameters" "GSS")
+	  #x1814 ("Running Speed and Cadence" "org.bluetooth.service.running_speed_and_cadence" "GSS")
+	  #x1815 ("Automation IO" "org.bluetooth.service.automation_io" "GSS")
+	  #x1816 ("Cycling Speed and Cadence" "org.bluetooth.service.cycling_speed_and_cadence" "GSS")
+	  #x1818 ("Cycling Power" "org.bluetooth.service.cycling_power" "GSS")
+	  #x1819 ("Location and Navigation" "org.bluetooth.service.location_and_navigation" "GSS")
+	  #x181A ("Environmental Sensing" "org.bluetooth.service.environmental_sensing" "GSS")
+	  #x181B ("Body Composition" "org.bluetooth.service.body_composition" "GSS")
 	  #x181C ("User Data" "org.bluetooth.service.user_data" "GSS")
-	  #x181D ("Weight Scale" "org.bluetooth.service.weight_scale" "GSS")))
+	  #x181D ("Weight Scale" "org.bluetooth.service.weight_scale" "GSS")
+	  #x181E ("Bond Management Service" "org.bluetooth.service.bond_management" "GSS")
+	  #x181F ("Continuous Glucose Monitoring" "org.bluetooth.service.continuous_glucose_monitoring" "GSS")
+	  #x1820 ("Internet Protocol Support Service" "org.bluetooth.service.internet_protocol_support" "GSS")
+	  #x1821 ("Indoor Positioning" "org.bluetooth.service.indoor_positioning" "GSS")
+	  #x1822 ("Pulse Oximeter Service" "org.bluetooth.service.pulse_oximeter" "GSS")
+	  #x1823 ("HTTP Proxy" "org.bluetooth.service.http_proxy" "GSS")
+	  #x1824 ("Transport Discovery" "org.bluetooth.service.transport_discovery" "GSS")
+	  #x1825 ("Object Transfer Service" "org.bluetooth.service.object_transfer" "GSS")
+	  #x1826 ("Fitness Machine" "org.bluetooth.service.fitness_machine" "GSS")
+	  #x1827 ("Mesh Provisioning Service" "org.bluetooth.service.mesh_provisioning" "GSS")
+	  #x1828 ("Mesh Proxy Service" "org.bluetooth.service.mesh_proxy" "GSS")
+	  #x1829 ("Reconnection Configuration" "org.bluetooth.service.reconnection_configuration" "GSS")
+	  #x183A ("Insulin Delivery" "org.bluetooth.service.insulin_delivery" "GSS")
+	  #x183B ("Binary Sensor" "GATT Service UUID" "BSS")
+	  #x183C ("Emergency Configuration" "GATT Service UUID" "EMCS")
+	  #x183E ("Physical Activity Monitor")
+	  #x1843 ("Audio Input Control")
+	  #x1844 ("Volume Control")
+	  #x1845 ("Volume Offset Control")
+	  #x1846 ("Coordinated Set Identification Service")
+	  #x1847 ("Device Time")
+	  #x1848 ("Media Control Service")
+	  #x1849 ("Generic Media Control Service")
+	  #x184A ("Constant Tone Extension")
+	  #x184B ("Telephone Bearer Service")
+	  #x184C ("Generic Telephone Bearer Service")
+	  #x184D ("Microphone Control")
+	  #x184E ("Audio Stream Control Service")
+	  #x184F ("Broadcast Audio Scan Service")
+	  #x1850 ("Published Audio Capabilities Service")
+	  #x1851 ("Basic Audio Announcement Service")
+	  #x1852 ("Broadcast Audio Announcement Service")
+	  #x1853 ("Common Audio Service*")))
   "Bluetooth GATT service UUIDs.")
 
 (define-obsolete-variable-alias 'bluetooth--sdo-uuid-alist
@@ -1121,7 +998,7 @@ scanning the bus, displaying device info etc."
 
 (defconst bluetooth--sdo-uuids
   #s(hash-table
-	 size 5 data
+	 size 10 data
 	 (#xFFF9
 	  ("Fast IDentity Online Alliance (FIDO)"
 	   "FIDO2 secure client-to-authenticator transport")
@@ -1136,14 +1013,14 @@ scanning the bus, displaying device info etc."
 
 
 ;;;; Bluetooth member UUIDs
-;; Last updated: 19. Sep 2020
+;; Last updated: 01. Jan 2022
 
 (define-obsolete-variable-alias 'bluetooth--member-uuid-alist
   'bluetooth--member-uuids "0.2")
 
 (defconst bluetooth--member-uuids
   #s(hash-table
-	 size 100 data
+	 size 500 data
 	 (#xFEFF
 	  ("GN Netcom")
 	  #xFEFE ("GN ReSound A/S")
@@ -1590,7 +1467,74 @@ scanning the bus, displaying device info etc."
 	  #xFD45 ("GB Solution co., Ltd")
 	  #xFD44 ("Apple Inc.")
 	  #xFD43 ("Apple Inc.")
-	  #xFD42 ("Globe (Jiangsu) Co., Ltd")))
+	  #xFD42 ("Globe (Jiangsu) Co., Ltd")
+	  #xFD41 ("Amazon Lab126")
+	  #xFD40 ("Beflex Inc.")
+	  #xFD3F ("Cognosos, Inc")
+	  #xFD3E ("Pure Watercraft, inc.")
+	  #xFD3D ("Woan Technology (Shenzhen) Co., Ltd.")
+	  #xFD3C ("Redline Communications Inc.")
+	  #xFD3B ("Verkada Inc.")
+	  #xFD3A ("Verkada Inc.")
+	  #xFD39 ("PREDIKTAS")
+	  #xFD38 ("Danfoss A/S")
+	  #xFD37 ("TireCheck GmbH")
+	  #xFD36 ("Google LLC")
+	  #xFD35 ("Transsion Holdings Limited")
+	  #xFD34 ("Aerosens LLC.")
+	  #xFD33 ("DashLogic, Inc.")
+	  #xFD32 ("Gemalto Holding BV")
+	  #xFD31 ("LG Electronics Inc.")
+	  #xFD30 ("Sesam Solutions BV")
+	  #xFD2F ("Bitstrata Systems Inc.")
+	  #xFD2E ("Bitstrata Systems Inc.")
+	  #xFD2D ("Xiaomi Inc.")
+	  #xFD2C ("The Access Technologies")
+	  #xFD2B ("The Access Technologies")
+	  #xFD2A ("Sony Corporation")
+	  #xFD29 ("Asahi Kasei Corporation")
+	  #xFD28 ("Julius Blum GmbH")
+	  #xFD27 ("i2Systems")
+	  #xFD26 ("Novo Nordisk A/S")
+	  #xFD25 ("GD Midea Air-Conditioning Equipment Co., Ltd.")
+	  #xFD24 ("GD Midea Air-Conditioning Equipment Co., Ltd.")
+	  #xFD23 ("DOM Sicherheitstechnik GmbH & Co. KG")
+	  #xFD22 ("Huawei Technologies Co., Ltd.")
+	  #xFD21 ("Huawei Technologies Co., Ltd.")
+	  #xFD20 ("GN Hearing A/S")
+	  #xFD1F ("3M")
+	  #xFD1E ("Plume Design Inc.")
+	  #xFD1D ("Samsung Electronics Co., Ltd")
+	  #xFD1C ("Brady Worldwide Inc.")
+	  #xFD1B ("Helios Sports, Inc.")
+	  #xFD1A ("CSIRO")
+	  #xFD19 ("Smith & Nephew Medical Limited")
+	  #xFD18 ("LEGIC Identsystems AG")
+	  #xFD17 ("LEGIC Identsystems AG")
+	  #xFD16 ("Sensitech, Inc.")
+	  #xFD15 ("Panasonic Corporation")
+	  #xFD14 ("BRG Sports, Inc.")
+	  #xFD13 ("BRG Sports, Inc.")
+	  #xFD12 ("AEON MOTOR CO.,LTD.")
+	  #xFD11 ("AEON MOTOR CO.,LTD.")
+	  #xFD10 ("AEON MOTOR CO.,LTD.")
+	  #xFD0F ("AEON MOTOR CO.,LTD.")
+	  #xFD0E ("HerdDogg, Inc")
+	  #xFD0D ("Blecon Ltd")
+	  #xFD0C ("OSM HK Limited")
+	  #xFD0B ("Luminostics, Inc.")
+	  #xFD0A ("Luminostics, Inc.")
+	  #xFD09 ("Cousins and Sears LLC")
+	  #xFD08 ("Bull Group Incorporated Company")
+	  #xFD07 ("Swedlock AB")
+	  #xFD06 ("RACE-AI LLC")
+	  #xFD05 ("Qualcomm Technologies, Inc.")
+	  #xFD04 ("Shure Inc.​")
+	  #xFD03 ("Quuppa Oy")
+	  #xFD02 ("LEGO System A/S")
+	  #xFD01 ("Sanvita Medical Corporation")
+	  #xFD00 ("FUTEK Advanced Sensor Technology, Inc.")
+	  #xFCFF ("701x")))
   "Bluetooth member UUIDs.")
 
 
@@ -1600,7 +1544,7 @@ scanning the bus, displaying device info etc."
 
 (defconst bluetooth--uuids
   `((#xfff0 . ,bluetooth--sdo-uuids)
-	(#xfd00 . ,bluetooth--member-uuids)
+	(#xfc00 . ,bluetooth--member-uuids)
 	(#x1800 . ,bluetooth--gatt-service-uuids)
 	(#x0 . ,bluetooth--service-class-uuids))
   "Bluetooth UUID tables sorted by beginning of range.")
@@ -1612,8 +1556,8 @@ scanning the bus, displaying device info etc."
 	(when (string-match uuid-re uuid)
 	  (let ((service-id (string-to-number (match-string 1 uuid) 16)))
 		(or (gethash service-id
-					 (cdr (-find (lambda (x) (>= service-id (car x)))
-								 bluetooth--uuids)))
+					 (cl-rest (--first (>= service-id (cl-first it))
+									   bluetooth--uuids)))
 			(list  (format "#x%08x" service-id) "unknown"))))))
 
 (defun bluetooth--parse-class (class)
@@ -1637,15 +1581,15 @@ scanning the bus, displaying device info etc."
 (defun bluetooth--class-parse-bitfield (bitfield data)
   "Parse BITFIELD using DATA as specification."
   (or (delq nil (mapcar (lambda (x)
-						  (if (/= 0 (logand bitfield (lsh 1 (car x))))
-							  (cdr x)
+						  (if (/= 0 (logand bitfield (lsh 1 (cl-first x))))
+							  (cl-rest x)
 							nil))
 						data))
 	  "unknown"))
 
 (defun bluetooth--class-parse-major (field data)
   "Parse major class FIELD using DATA as specification."
-  (or (car (alist-get field data))
+  (or (cl-first (alist-get field data))
 	  "unknown"))
 
 (defun bluetooth--class-parse-value (field data)
@@ -1655,24 +1599,26 @@ scanning the bus, displaying device info etc."
 
 (defun bluetooth--class-parse-peripheral (field data)
   "Parse peripheral class FIELD using DATA as specification."
-  (or (list (bluetooth--class-parse-value (logand (caar data) field)
-										  (cdar data))
-			(bluetooth--class-parse-value (logand (caadr data) field)
-										  (cdadr data)))
-	  "unknown"))
+  (-let (((cat-mask . categories) (cl-first data))
+		 ((sub-mask . sub-groups) (cl-second data)))
+	(or (list (bluetooth--class-parse-value (logand cat-mask field)
+											categories)
+			  (bluetooth--class-parse-value (logand sub-mask field)
+											sub-groups))
+		"unknown")))
 
 (defun bluetooth--class-get-minor (field data)
   "Get the minor field spec for FIELD using DATA as specification."
-  (symbol-value (cdr (alist-get field data))))
+  (symbol-value (cl-rest (alist-get field data))))
 
 
 ;;;; Bluetooth company IDs
 
 ;; Very long list of manufacturer IDs.
-;; Last updated: 19. Sep 2020
+;; Last updated: 01. Jan 2022
 (defconst bluetooth--manufacturer-ids
   #s(hash-table
-	 size 500 data
+	 size 3000 data
 	 (#x0000
 	  "Ericsson Technology Licensing"
 	  #x0001 "Nokia Mobile Phones"
@@ -2217,7 +2163,7 @@ scanning the bus, displaying device info etc."
 	  #x021C "Mobicomm Inc"
 	  #x021D "Edamic"
 	  #x021E "Goodnet, Ltd"
-	  #x021F "Luster Leaf Products  Inc"
+	  #x021F "Luster Leaf Products	Inc"
 	  #x0220 "Manus Machina BV"
 	  #x0221 "Mobiquity Networks Inc"
 	  #x0222 "Praxis Dynamics"
@@ -4071,71 +4017,791 @@ scanning the bus, displaying device info etc."
 	  #x0960 "Sena Technologies Inc."
 	  #x0961 "Linkura AB"
 	  #x0962 "GL Solutions K.K."
-	  #x0963 "Moonbird BV"))
+	  #x0963 "Moonbird BV"
+	  #x0964 "Countrymate Technology Limited"
+	  #x0965 "Asahi Kasei Corporation"
+	  #x0966 "PointGuard, LLC"
+	  #x0967 "Neo Materials and Consulting Inc."
+	  #x0968 "Actev Motors, Inc."
+	  #x0969 "Woan Technology (Shenzhen) Co., Ltd."
+	  #x096A "dricos, Inc."
+	  #x096B "Guide ID B.V."
+	  #x096C "9374-7319 Quebec inc"
+	  #x096D "Gunwerks, LLC"
+	  #x096E "Band Industries, inc."
+	  #x096F "Lund Motion Products, Inc."
+	  #x0970 "IBA Dosimetry GmbH"
+	  #x0971 "GA"
+	  #x0972 "Closed Joint Stock Company \"Zavod Flometr\" (\"Zavod Flometr\" CJSC)"
+	  #x0973 "Popit Oy"
+	  #x0974 "ABEYE"
+	  #x0975 "BlueIOT(Beijing) Technology Co.,Ltd"
+	  #x0976 "Fauna Audio GmbH"
+	  #x0977 "TOYOTA motor corporation"
+	  #x0978 "ZifferEins GmbH & Co. KG"
+	  #x0979 "BIOTRONIK SE & Co. KG"
+	  #x097A "CORE CORPORATION"
+	  #x097B "CTEK Sweden AB"
+	  #x097C "Thorley Industries, LLC"
+	  #x097D "CLB B.V."
+	  #x097E "SonicSensory Inc"
+	  #x097F "ISEMAR S.R.L."
+	  #x0980 "DEKRA TESTING AND CERTIFICATION, S.A.U."
+	  #x0981 "Bernard Krone Holding SE & Co.KG"
+	  #x0982 "ELPRO-BUCHS AG"
+	  #x0983 "Feedback Sports LLC"
+	  #x0984 "TeraTron GmbH"
+	  #x0985 "Lumos Health Inc."
+	  #x0986 "Cello Hill, LLC"
+	  #x0987 "TSE BRAKES, INC."
+	  #x0988 "BHM-Tech Produktionsgesellschaft m.b.H"
+	  #x0989 "WIKA Alexander Wiegand SE & Co.KG"
+	  #x098A "Biovigil"
+	  #x098B "Mequonic Engineering, S.L."
+	  #x098C "bGrid B.V."
+	  #x098D "C3-WIRELESS, LLC"
+	  #x098E "ADVEEZ"
+	  #x098F "Aktiebolaget Regin"
+	  #x0990 "Anton Paar GmbH"
+	  #x0991 "Telenor ASA"
+	  #x0992 "Big Kaiser Precision Tooling Ltd"
+	  #x0993 "Absolute Audio Labs B.V."
+	  #x0994 "VT42 Pty Ltd"
+	  #x0995 "Bronkhorst High-Tech B.V."
+	  #x0996 "C. & E. Fein GmbH"
+	  #x0997 "NextMind"
+	  #x0998 "Pixie Dust Technologies, Inc."
+	  #x0999 "eTactica ehf"
+	  #x099A "New Audio LLC"
+	  #x099B "Sendum Wireless Corporation"
+	  #x099C "deister electronic GmbH"
+	  #x099D "YKK AP Inc."
+	  #x099E "Step One Limited"
+	  #x099F "Koya Medical, Inc."
+	  #x09A0 "Proof Diagnostics, Inc."
+	  #x09A1 "VOS Systems, LLC"
+	  #x09A2 "ENGAGENOW DATA SCIENCES PRIVATE LIMITED"
+	  #x09A3 "ARDUINO SA"
+	  #x09A4 "KUMHO ELECTRICS, INC"
+	  #x09A5 "Security Enhancement Systems, LLC"
+	  #x09A6 "BEIJING ELECTRIC VEHICLE CO.,LTD"
+	  #x09A7 "Paybuddy ApS"
+	  #x09A8 "KHN Solutions Inc"
+	  #x09A9 "Nippon Ceramic Co.,Ltd."
+	  #x09AA "PHOTODYNAMIC INCORPORATED"
+	  #x09AB "DashLogic, Inc."
+	  #x09AC "Ambiq"
+	  #x09AD "Narhwall Inc."
+	  #x09AE "Pozyx NV"
+	  #x09AF "ifLink Open Community"
+	  #x09B0 "Deublin Company, LLC"
+	  #x09B1 "BLINQY"
+	  #x09B2 "DYPHI"
+	  #x09B3 "BlueX Microelectronics Corp Ltd."
+	  #x09B4 "PentaLock Aps."
+	  #x09B5 "AUTEC Gesellschaft fuer Automationstechnik mbH"
+	  #x09B6 "Pegasus Technologies, Inc."
+	  #x09B7 "Bout Labs, LLC"
+	  #x09B8 "PlayerData Limited"
+	  #x09B9 "SAVOY ELECTRONIC LIGHTING"
+	  #x09BA "Elimo Engineering Ltd"
+	  #x09BB "SkyStream Corporation"
+	  #x09BC "Aerosens LLC"
+	  #x09BD "Centre Suisse d'Electronique et de Microtechnique SA"
+	  #x09BE "Vessel Ltd."
+	  #x09BF "Span.IO, Inc."
+	  #x09C0 "AnotherBrain inc."
+	  #x09C1 "Rosewill"
+	  #x09C2 "Universal Audio, Inc."
+	  #x09C3 "JAPAN TOBACCO INC."
+	  #x09C4 "UVISIO"
+	  #x09C5 "HungYi Microelectronics Co.,Ltd."
+	  #x09C6 "Honor Device Co., Ltd."
+	  #x09C7 "Combustion, LLC"
+	  #x09C8 "XUNTONG"
+	  #x09C9 "CrowdGlow Ltd"
+	  #x09CA "Mobitrace"
+	  #x09CB "Hx Engineering, LLC"
+	  #x09CC "Senso4s d.o.o."
+	  #x09CD "Blyott"
+	  #x09CE "Julius Blum GmbH"
+	  #x09CF "BlueStreak IoT, LLC"
+	  #x09D0 "Chess Wise B.V."
+	  #x09D1 "ABLEPAY TECHNOLOGIES AS"
+	  #x09D2 "Temperature Sensitive Solutions Systems Sweden AB"
+	  #x09D3 "HeartHero, inc."
+	  #x09D4 "ORBIS Inc."
+	  #x09D5 "GEAR RADIO ELECTRONICS CORP."
+	  #x09D6 "EAR TEKNIK ISITME VE ODIOMETRI CIHAZLARI SANAYI VE TICARET ANONIM SIRKETI"
+	  #x09D7 "Coyotta"
+	  #x09D8 "Synergy Tecnologia em Sistemas Ltda"
+	  #x09D9 "VivoSensMedical GmbH"
+	  #x09DA "Nagravision SA"
+	  #x09DB "Bionic Avionics Inc."
+	  #x09DC "AON2 Ltd."
+	  #x09DD "Innoware Development AB"
+	  #x09DE "JLD Technology Solutions, LLC"
+	  #x09DF "Magnus Technology Sdn Bhd"
+	  #x09E0 "Preddio Technologies Inc."
+	  #x09E1 "Tag-N-Trac Inc"
+	  #x09E2 "Wuhan Linptech Co.,Ltd."
+	  #x09E3 "Friday Home Aps"
+	  #x09E4 "CPS AS"
+	  #x09E5 "Mobilogix"
+	  #x09E6 "Masonite Corporation"
+	  #x09E7 "Kabushikigaisha HANERON"
+	  #x09E8 "Melange Systems Pvt. Ltd."
+	  #x09E9 "LumenRadio AB"
+	  #x09EA "Athlos Oy"
+	  #x09EB "KEAN ELECTRONICS PTY LTD"
+	  #x09EC "Yukon advanced optics worldwide, UAB"
+	  #x09ED "Sibel Inc."
+	  #x09EE "OJMAR SA"
+	  #x09EF "Steinel Solutions AG"
+	  #x09F0 "WatchGas B.V."
+	  #x09F1 "OM Digital Solutions Corporation"
+	  #x09F2 "Audeara Pty Ltd"
+	  #x09F3 "Beijing Zero Zero Infinity Technology Co.,Ltd."
+	  #x09F4 "Spectrum Technologies, Inc."
+	  #x09F5 "OKI Electric Industry Co., Ltd"
+	  #x09F6 "Mobile Action Technology Inc."
+	  #x09F7 "SENSATEC Co., Ltd."
+	  #x09F8 "R.O. S.R.L."
+	  #x09F9 "Hangzhou Yaguan Technology Co. LTD"
+	  #x09FA "Listen Technologies Corporation"
+	  #x09FB "TOITU CO., LTD."
+	  #x09FC "Confidex"
+	  #x09FD "Keep Technologies, Inc."
+	  #x09FE "Lichtvision Engineering GmbH"
+	  #x09FF "AIRSTAR"
+	  #x0A00 "Ampler Bikes OU"
+	  #x0A01 "Cleveron AS"
+	  #x0A02 "Ayxon-Dynamics GmbH"
+	  #x0A03 "donutrobotics Co., Ltd."
+	  #x0A04 "Flosonics Medical"
+	  #x0A05 "Southwire Company, LLC"
+	  #x0A06 "Shanghai wuqi microelectronics Co.,Ltd"
+	  #x0A07 "Reflow Pty Ltd"
+	  #x0A08 "Oras Oy"
+	  #x0A09 "ECCT"
+	  #x0A0A "Volan Technology Inc."
+	  #x0A0B "SIANA Systems"
+	  #x0A0C "Shanghai Yidian Intelligent Technology Co., Ltd."
+	  #x0A0D "Blue Peacock GmbH"
+	  #x0A0E "Roland Corporation"
+	  #x0A0F "LIXIL Corporation"
+	  #x0A10 "SUBARU Corporation"
+	  #x0A11 "Sensolus"
+	  #x0A12 "Dyson Technology Limited"
+	  #x0A13 "Tec4med LifeScience GmbH"
+	  #x0A14 "CROXEL, INC."
+	  #x0A15 "Syng Inc"
+	  #x0A16 "RIDE VISION LTD"
+	  #x0A17 "Plume Design Inc"
+	  #x0A18 "Cambridge Animal Technologies Ltd"
+	  #x0A19 "Maxell, Ltd."
+	  #x0A1A "Link Labs, Inc."
+	  #x0A1B "Embrava Pty Ltd"
+	  #x0A1C "INPEAK S.C."
+	  #x0A1D "API-K"
+	  #x0A1E "CombiQ AB"
+	  #x0A1F "DeVilbiss Healthcare LLC"
+	  #x0A20 "Jiangxi Innotech Technology Co., Ltd"
+	  #x0A21 "Apollogic Sp. z o.o."
+	  #x0A22 "DAIICHIKOSHO CO., LTD."
+	  #x0A23 "BIXOLON CO.,LTD"
+	  #x0A24 "Atmosic Technologies, Inc."
+	  #x0A25 "Eran Financial Services LLC"
+	  #x0A26 "Louis Vuitton"
+	  #x0A27 "AYU DEVICES PRIVATE LIMITED"
+	  #x0A28 "NanoFlex"
+	  #x0A29 "Worthcloud Technology Co.,Ltd"
+	  #x0A2A "Yamaha Corporation"
+	  #x0A2B "PaceBait IVS"
+	  #x0A2C "Shenzhen H&T Intelligent Control Co., Ltd"
+	  #x0A2D "Shenzhen Feasycom Technology Co., Ltd."
+	  #x0A2E "Zuma Array Limited"
+	  #x0A2F "Instamic, Inc."
+	  #x0A30 "Air-Weigh"
+	  #x0A31 "Nevro Corp."
+	  #x0A32 "Pinnacle Technology, Inc."
+	  #x0A33 "WMF AG"
+	  #x0A34 "Luxer Corporation"
+	  #x0A35 "safectory GmbH"
+	  #x0A36 "NGK SPARK PLUG CO., LTD."
+	  #x0A37 "2587702 Ontario Inc."
+	  #x0A38 "Bouffalo Lab (Nanjing)., Ltd."
+	  #x0A39 "BLUETICKETING SRL"
+	  #x0A3A "Incotex Co. Ltd."
+	  #x0A3B "Galileo Technology Limited"
+	  #x0A3C "Siteco GmbH"
+	  #x0A3D "DELABIE"
+	  #x0A3E "Hefei Yunlian Semiconductor Co., Ltd"
+	  #x0A3F "Shenzhen Yopeak Optoelectronics Technology Co., Ltd."
+	  #x0A40 "GEWISS S.p.A."
+	  #x0A41 "OPEX Corporation"
+	  #x0A42 "Motionalysis, Inc."
+	  #x0A43 "Busch Systems International Inc."
+	  #x0A44 "Novidan, Inc."
+	  #x0A45 "3SI Security Systems, Inc"
+	  #x0A46 "Beijing HC-Infinite Technology Limited"
+	  #x0A47 "The Wand Company Ltd"
+	  #x0A48 "JRC Mobility Inc."
+	  #x0A49 "Venture Research Inc."
+	  #x0A4A "Map Large, Inc."
+	  #x0A4B "MistyWest Energy and Transport Ltd."
+	  #x0A4C "SiFli Technologies (shanghai) Inc."
+	  #x0A4D "Lockn Technologies Private Limited"
+	  #x0A4E "Toytec Corporation"
+	  #x0A4F "VANMOOF Global Holding B.V."
+	  #x0A50 "Nextscape Inc."
+	  #x0A51 "CSIRO"
+	  #x0A52 "Follow Sense Europe B.V."
+	  #x0A53 "KKM COMPANY LIMITED"
+	  #x0A54 "SQL Technologies Corp."
+	  #x0A55 "Inugo Systems Limited"
+	  #x0A56 "ambie"
+	  #x0A57 "Meizhou Guo Wei Electronics Co., Ltd"
+	  #x0A58 "Indigo Diabetes"
+	  #x0A59 "TourBuilt, LLC"
+	  #x0A5A "Sontheim Industrie Elektronik GmbH"
+	  #x0A5B "LEGIC Identsystems AG"
+	  #x0A5C "Innovative Design Labs Inc."
+	  #x0A5D "MG Energy Systems B.V."
+	  #x0A5E "LaceClips llc"
+	  #x0A5F "stryker"
+	  #x0A60 "DATANG SEMICONDUCTOR TECHNOLOGY CO.,LTD"
+	  #x0A61 "Smart Parks B.V."
+	  #x0A62 "MOKO TECHNOLOGY Ltd"
+	  #x0A63 "Gremsy JSC"
+	  #x0A64 "Geopal system A/S"
+	  #x0A65 "Lytx, INC."
+	  #x0A66 "JUSTMORPH PTE. LTD."
+	  #x0A67 "Beijing SuperHexa Century Technology CO. Ltd"
+	  #x0A68 "Focus Ingenieria SRL"
+	  #x0A69 "HAPPIEST BABY, INC."
+	  #x0A6A "Scribble Design Inc."
+	  #x0A6B "Olympic Ophthalmics, Inc."
+	  #x0A6C "Pokkels"
+	  #x0A6D "KUUKANJYOKIN Co.,Ltd."
+	  #x0A6E "Pac Sane Limited"
+	  #x0A6F "Warner Bros."
+	  #x0A70 "Ooma"
+	  #x0A71 "Senquip Pty Ltd"
+	  #x0A72 "Jumo GmbH & Co. KG"
+	  #x0A73 "Innohome Oy"
+	  #x0A74 "MICROSON S.A."
+	  #x0A75 "Delta Cycle Corporation"
+	  #x0A76 "Synaptics Incorporated"
+	  #x0A77 "JMD PACIFIC PTE. LTD."
+	  #x0A78 "Shenzhen Sunricher Technology Limited"
+	  #x0A79 "Webasto SE"
+	  #x0A7A "Emlid Limited"
+	  #x0A7B "UniqAir Oy"
+	  #x0A7C "WAFERLOCK"
+	  #x0A7D "Freedman Electronics Pty Ltd"
+	  #x0A7E "Keba AG"
+	  #x0A7F "Intuity Medical"
+	  #x0A80 "Cleer Limited"
+	  #x0A81 "Universal Biosensors Pty Ltd"
+	  #x0A82 "Corsair"
+	  #x0A83 "Rivata, Inc."
+	  #x0A84 "Greennote Inc,"
+	  #x0A85 "Snowball Technology Co., Ltd."
+	  #x0A86 "ALIZENT International"
+	  #x0A87 "Shanghai Smart System Technology Co., Ltd"
+	  #x0A88 "PSA Peugeot Citroen"
+	  #x0A89 "SES-Imagotag"
+	  #x0A8A "HAINBUCH SPANNENDE TECHNIK"
+	  #x0A8B "SANlight GmbH"
+	  #x0A8C "DelpSys, s.r.o."
+	  #x0A8D "JCM TECHNOLOGIES S.A."
+	  #x0A8E "Perfect Company"
+	  #x0A8F "TOTO LTD."
+	  #x0A90 "Shenzhen Grandsun Electronic Co.,Ltd."
+	  #x0A91 "Monarch International Inc."
+	  #x0A92 "Carestream Dental LLC"
+	  #x0A93 "GiPStech S.r.l."
+	  #x0A94 "OOBIK Inc."
+	  #x0A95 "Pamex Inc."
+	  #x0A96 "Lightricity Ltd"
+	  #x0A97 "SensTek"
+	  #x0A98 "Foil, Inc."
+	  #x0A99 "Shanghai high-flying electronics technology Co.,Ltd"
+	  #x0A9A "TEMKIN ASSOCIATES, LLC"
+	  #x0A9B "Eello LLC"
+	  #x0A9C "Xi'an Fengyu Information Technology Co., Ltd."
+	  #x0A9D "Canon Finetech Nisca Inc."
+	  #x0A9E "LifePlus, Inc."
+	  #x0A9F "ista International GmbH"
+	  #x0AA0 "Loy Tec electronics GmbH"
+	  #x0AA1 "LINCOGN TECHNOLOGY CO. LIMITED"
+	  #x0AA2 "Care Bloom, LLC"
+	  #x0AA3 "DIC Corporation"
+	  #x0AA4 "FAZEPRO LLC"
+	  #x0AA5 "Shenzhen Uascent Technology Co., Ltd"
+	  #x0AA6 "Realityworks, inc."
+	  #x0AA7 "Urbanista AB"
+	  #x0AA8 "Zencontrol Pty Ltd"
+	  #x0AA9 "Mrinq Technologies LLC"
+	  #x0AAA "Computime International Ltd"
+	  #x0AAB "Anhui Listenai Co"
+	  #x0AAC "OSM HK Limited"
+	  #x0AAD "Adevo Consulting AB"
+	  #x0AAE "PS Engineering, Inc."
+	  #x0AAF "AIAIAI ApS"
+	  #x0AB0 "Visiontronic s.r.o."
+	  #x0AB1 "InVue Security Products Inc"
+	  #x0AB2 "TouchTronics, Inc."
+	  #x0AB3 "INNER RANGE PTY. LTD."
+	  #x0AB4 "Ellenby Technologies, Inc."
+	  #x0AB5 "Elstat Ltd [ Formerly Elstat Electronics Ltd.]"
+	  #x0AB6 "Xenter, Inc."
+	  #x0AB7 "LogTag North America Inc."
+	  #x0AB8 "Sens.ai Incorporated"
+	  #x0AB9 "STL"
+	  #x0ABA "Open Bionics Ltd."
+	  #x0ABB "R-DAS, s.r.o."
+	  #x0ABC "KCCS Mobile Engineering Co., Ltd."
+	  #x0ABD "Inventas AS"
+	  #x0ABE "Robkoo Information & Technologies Co., Ltd."
+	  #x0ABF "PAUL HARTMANN AG"
+	  #x0AC0 "Omni-ID USA, INC."
+	  #x0AC1 "Shenzhen Jingxun Technology Co., Ltd."
+	  #x0AC2 "RealMega Microelectronics technology (Shanghai) Co. Ltd."
+	  #x0AC3 "Kenzen, Inc."
+	  #x0AC4 "CODIUM"
+	  #x0AC5 "Flexoptix GmbH"
+	  #x0AC6 "Barnes Group Inc."
+	  #x0AC7 "Chengdu Aich Technology Co.,Ltd"
+	  #x0AC8 "Keepin Co., Ltd."
+	  #x0AC9 "Swedlock AB"
+	  #x0ACA "Shenzhen CoolKit Technology Co., Ltd"
+	  #x0ACB "ise Individuelle Software und Elektronik GmbH"
+	  #x0ACC "Nuvoton"
+	  #x0ACD "Visuallex Sport International Limited"
+	  #x0ACE "KOBATA GAUGE MFG. CO., LTD."
+	  #x0ACF "CACI Technologies"
+	  #x0AD0 "Nordic Strong ApS"
+	  #x0AD1 "EAGLE KINGDOM TECHNOLOGIES LIMITED"
+	  #x0AD2 "Lautsprecher Teufel GmbH"
+	  #x0AD3 "SSV Software Systems GmbH"
+	  #x0AD4 "Zhuhai Pantum Electronisc Co., Ltd"
+	  #x0AD5 "Streamit B.V."
+	  #x0AD6 "nymea GmbH"
+	  #x0AD7 "AL-KO Geraete GmbH"
+	  #x0AD8 "Franz Kaldewei GmbH&Co KG"
+	  #x0AD9 "Shenzhen Aimore. Co.,Ltd"
+	  #x0ADA "Codefabrik GmbH"
+	  #x0ADB "Reelables, Inc."
+	  #x0ADC "Duravit AG"
+	  #x0ADD "Boss Audio"
+	  #x0ADE "Vocera Communications, Inc."
+	  #x0ADF "Douglas Dynamics L.L.C."
+	  #x0AE0 "Viceroy Devices Corporation"
+	  #x0AE1 "ChengDu ForThink Technology Co., Ltd."
+	  #x0AE2 "IMATRIX SYSTEMS, INC."
+	  #x0AE3 "GlobalMed"
+	  #x0AE4 "DALI Alliance"
+	  #x0AE5 "unu GmbH"
+	  #x0AE6 "Hexology"
+	  #x0AE7 "Sunplus Technology Co., Ltd."
+	  #x0AE8 "LEVEL, s.r.o."
+	  #x0AE9 "FLIR Systems AB"
+	  #x0AEA "Borda Technology"
+	  #x0AEB "Square, Inc."
+	  #x0AEC "FUTEK ADVANCED SENSOR TECHNOLOGY, INC"
+	  #x0AED "Saxonar GmbH"
+	  #x0AEE "Velentium, LLC"
+	  #x0AEF "GLP German Light Products GmbH"
+	  #x0AF0 "Leupold & Stevens, Inc."
+	  #x0AF1 "CRADERS,CO.,LTD"
+	  #x0AF2 "Shanghai All Link Microelectronics Co.,Ltd"
+	  #x0AF3 "701x Inc."
+	  #x0AF4 "Radioworks Microelectronics PTY LTD"
+	  #x0AF5 "Unitech Electronic Inc."
+	  #x0AF6 "AMETEK, Inc."
+	  #x0AF7 "Irdeto"
+	  #x0AF8 "First Design System Inc."
+	  #x0AF9 "Unisto AG"
+	  #x0AFA "Chengdu Ambit Technology Co., Ltd."
+	  #x0AFB "SMT ELEKTRONIK GmbH"
+	  #x0AFC "Cerebrum Sensor Technologies Inc."
+	  #x0AFD "Weber Sensors, LLC"
+	  #x0AFE "Earda Technologies Co.,Ltd"))
   "Bluetooth manufacturer IDs.")
+
+;;;; command definitions
+
+(eval-and-compile
+  (defun bluetooth--function-name (name &optional prefix)
+	"Make a function name out of NAME and PREFIX.
+The generated function name has the form ‘bluetoothPREFIX-NAME’."
+	(let ((case-fold-search nil))
+	  (concat "bluetooth"
+			  prefix
+			  (replace-regexp-in-string "[[:upper:]][[:lower:]]+"
+										(lambda (x) (concat "-" (downcase x)))
+										name t)))))
+
+(defun bluetooth--choose-uuid ()
+  "Ask for a UUID and return it in a form suitable for ‘interactive’."
+  (if current-prefix-arg
+	  (let* ((device (bluetooth--device (tabulated-list-get-id)))
+			 (uuids (bluetooth--device-uuids
+					 (bluetooth-device-properties device)))
+			 (profile (completing-read "Profile: "
+									   (mapcar (lambda (x)
+												 (let ((desc (cl-second x)))
+												   (concat (cl-first desc)
+														   ", "
+														   (cl-second desc))))
+											   uuids)
+									   nil t)))
+		(list (cl-rassoc profile uuids
+						 :key (lambda (x)
+								(let ((desc (cl-first x)))
+								  (concat (cl-first desc) ", " (cl-second desc))))
+						 :test #'string=)))
+	'(nil)))
+
+(defun bluetooth-connect (uuid)
+  "Connect to the Bluetooth device at point.
+When called with a prefix argument, ask for a profile and
+connect only this profile.  Otherwise, or when called
+non-interactively with UUID set to nil, connect to all profiles."
+  (interactive (bluetooth--choose-uuid))
+  (if uuid
+	  (bluetooth--dbus-method "ConnectProfile" :device (cl-first uuid))
+	(bluetooth--dbus-method "Connect" :device)))
+
+(defun bluetooth-disconnect (uuid)
+  "Disconnect the Bluetooth device at point.
+When called with a prefix argument, ask for a profile and
+disconnect only this profile.  Otherwise, or when called
+non-interactively with UUID set to nil, disconnect all
+profiles."
+  (interactive (bluetooth--choose-uuid))
+  (if uuid
+	  (bluetooth--dbus-method "DisconnectProfile" :device (cl-first uuid))
+	(bluetooth--dbus-method "Disconnect" :device)))
+
+(defun bluetooth-connect-profile ()
+  "Ask for a Bluetooth profile and connect the device at point to it."
+  (interactive)
+  (let ((prefix-arg (list 4)))
+	(command-execute #'bluetooth-connect)))
+
+(defun bluetooth-disconnect-profile ()
+  "Ask for a Bluetooth profile and disconnect the device at point from it."
+  (interactive)
+  (let ((prefix-arg (list 4)))
+	(command-execute #'bluetooth-disconnect)))
+
+
+(defmacro bluetooth-defun-method (method api docstring &rest body)
+  (declare (doc-string 3) (indent 2))
+  (let ((name (bluetooth--function-name method)))
+	`(defun ,(intern name) () ,docstring
+			(interactive)
+			(bluetooth--dbus-method ,method ,api)
+			,@body)))
+
+(bluetooth-defun-method "StartDiscovery" :adapter
+  "Start discovery mode."
+  (setq bluetooth--update-timer
+		(run-at-time nil bluetooth-update-interval
+					 #'bluetooth--update-print)))
+
+(bluetooth-defun-method "StopDiscovery" :adapter
+  "Stop discovery mode."
+  (cancel-timer bluetooth--update-timer))
+
+(bluetooth-defun-method "Pair" :device
+  "Pair with device at point.")
+
+(defmacro bluetooth-defun-toggle (property api docstring)
+  (declare (doc-string 3) (indent 2))
+  (let ((name (bluetooth--function-name property "-toggle")))
+	`(defun ,(intern name) () ,docstring
+			(interactive)
+			(bluetooth--dbus-toggle ,property ,api))))
+
+(bluetooth-defun-toggle "Blocked" :device
+  "Mark Bluetooth device at point blocked.")
+(bluetooth-defun-toggle "Trusted" :device
+  "Mark Bluetooth device at point trusted.")
+(bluetooth-defun-toggle "Powered" :adapter
+  "Toggle power supply of adapter.")
+(bluetooth-defun-toggle "Discoverable" :adapter
+  "Toggle discoverable mode.")
+(bluetooth-defun-toggle "Pairable" :adapter
+  "Toggle pairable mode.")
+
+(defun bluetooth-set-alias (name)
+  "Set alias of Bluetooth device at point to NAME."
+  (interactive "MAlias (empty to reset): ")
+  (bluetooth--dbus-set "Alias" name :device))
+
+(defun bluetooth-remove-device ()
+  "Remove Bluetooth device at point (unpaires device and host)."
+  (interactive)
+  (when-let (dev-id (tabulated-list-get-id))
+	(bluetooth--call-method dev-id
+							:adapter
+							#'dbus-call-method-asynchronously
+							"RemoveDevice"
+							nil
+							:timeout bluetooth--timeout
+							:object-path :path-devid)))
+
+(defun bluetooth-end-of-list ()
+  "Move cursor to the last list element."
+  (interactive)
+  (let ((column (current-column)))
+	(goto-char (point-max))
+	(forward-line -1)
+	(goto-char (+ (point)
+				  (- column (current-column))))))
+
+(defun bluetooth-beginning-of-list ()
+  "Move cursor to the first list element."
+  (interactive)
+  (let ((column (current-column)))
+	(goto-char (point-min))
+	(goto-char (+ (point)
+				  (- column (current-column))))))
 
 
-;;;; device info display
+;;;; keymap and menu
+
+(defvar bluetooth-mode-map
+  (let ((map (make-sparse-keymap)))
+	(set-keymap-parent map tabulated-list-mode-map)
+	(define-key map [?c] #'bluetooth-connect)
+	(define-key map [?d] #'bluetooth-disconnect)
+	(define-key map [?b] #'bluetooth-toggle-blocked)
+	(define-key map [?t] #'bluetooth-toggle-trusted)
+	(define-key map [?a] #'bluetooth-set-alias)
+	(define-key map [?r] #'bluetooth-start-discovery)
+	(define-key map [?R] #'bluetooth-stop-discovery)
+	(define-key map [?s] #'bluetooth-toggle-powered)
+	(define-key map [?P] #'bluetooth-pair)
+	(define-key map [?D] #'bluetooth-toggle-discoverable)
+	(define-key map [?x] #'bluetooth-toggle-pairable)
+	(define-key map [?i] #'bluetooth-show-device-info)
+	(define-key map [?A] #'bluetooth-show-adapter-info)
+	(define-key map [?k] #'bluetooth-remove-device)
+	(define-key map [?<] #'bluetooth-beginning-of-list)
+	(define-key map [?>] #'bluetooth-end-of-list)
+
+	(define-key map [menu-bar bluetooth]
+	  (cons "Bluetooth" (make-sparse-keymap "Bluetooth")))
+	(define-key map [menu-bar bluetooth device]
+	  (cons "Device" (make-sparse-keymap "Device")))
+
+	(define-key map [menu-bar bluetooth stop-discovery]
+	  '(menu-item "Stop discovery" bluetooth-stop-discovery
+				  :help "Stop discovery"))
+	(define-key map [menu-bar bluetooth start-discovery]
+	  '(menu-item "Start discovery" bluetooth-start-discovery
+				  :help "Start discovery"))
+	(define-key map [menu-bar bluetooth toggle-discoverable]
+	  '(menu-item "Toggle discoverable" bluetooth-toggle-discoverable
+				  :help "Toggle discoverable mode"))
+	(define-key map [menu-bar bluetooth toggle-pairable]
+	  '(menu-item "Toggle pairable" bluetooth-toggle-pairable
+				  :help "Toggle pairable mode"))
+	(define-key map [menu-bar bluetooth toggle-powered]
+	  '(menu-item "Toggle powered" bluetooth-toggle-powered
+				  :help "Toggle power supply of adapter"))
+	(define-key map [menu-bar bluetooth show-adapter-info]
+	  '(menu-item "Show adapter info" bluetooth-show-adapter-info
+				  :help "Show bluetooth adapter info"))
+
+	(define-key map [menu-bar bluetooth device show-info]
+	  '(menu-item "Show device info" bluetooth-show-device-info
+				  :help "Show bluetooth device info"))
+	(define-key map [menu-bar bluetooth device set-alias]
+	  '(menu-item "Set device alias" bluetooth-set-alias
+				  :help "Set device alias"))
+	(define-key map [menu-bar bluetooth device toggle-trusted]
+	  '(menu-item "Toggle trusted" bluetooth-toggle-trusted
+				  :help "Trust/untrust bluetooth device"))
+	(define-key map [menu-bar bluetooth device toggle-blocked]
+	  '(menu-item "Toggle blocked" bluetooth-toggle-blocked
+				  :help "Block/unblock bluetooth device"))
+	(define-key map [menu-bar bluetooth device disconnect-profile]
+	  '(menu-item "Disconnect profile" bluetooth-disconnect-profile
+				  :help "Disconnect bluetooth device profile"))
+	(define-key map [menu-bar bluetooth device disconnect]
+	  '(menu-item "Disconnect" bluetooth-disconnect
+				  :help "Disconnect bluetooth device"))
+	(define-key map [menu-bar bluetooth device connect-profile]
+	  '(menu-item "Connect profile" bluetooth-connect-profile
+				  :help "Connect bluetooth device profile"))
+	(define-key map [menu-bar bluetooth device connect]
+	  '(menu-item "Connect" bluetooth-connect
+				  :help "Connect bluetooth device"))
+	(define-key map [menu-bar bluetooth device remove]
+	  '(menu-item "Remove" bluetooth-remove-device
+				  :help "Remove bluetooth device"))
+	(define-key map [menu-bar bluetooth device pair]
+	  '(menu-item "Pair" bluetooth-pair
+				  :help "Pair bluetooth device"))
+
+	map)
+  "The Bluetooth mode keymap.")
+
+
+;;;; mode definition
+
+(define-derived-mode bluetooth-mode tabulated-list-mode
+  bluetooth--mode-name
+  "Major mode for managing Bluetooth devices."
+  (setq tabulated-list-format bluetooth--list-format
+		tabulated-list-entries #'bluetooth--list-entries
+		tabulated-list-padding 0
+		tabulated-list-sort-key (cons "Alias" nil))
+  (add-hook 'tabulated-list-revert-hook #'bluetooth--update-all)
+  (tabulated-list-init-header)
+  (tabulated-list-print)
+  (hl-line-mode))
+
+
+;;;; device and adapter info display
+
+(defun bluetooth--ins-heading (heading)
+  "Insert HEADING in info view."
+  (insert (propertize heading 'face
+					  'bluetooth-info-heading)))
+
+(defun bluetooth--ins-line (attr text)
+  "Insert attribute ATTR and corresponding TEXT in info view."
+  (insert (propertize (format "%21s" attr)
+					  'face
+					  'bluetooth-info-attribute)
+		  ": " text "\n"))
+
+(defun bluetooth--ins-attr (props attr)
+  "Insert information on attribute ATTR in properties alist PROPS."
+  (let ((value (cl-rest (assoc attr props))))
+	(bluetooth--ins-line attr
+						 (cond ((stringp value) value)
+							   ((numberp value)
+								(number-to-string value))
+							   ((consp value)
+								(mapconcat #'identity value ", "))
+							   ((null value) "no")
+							   (t "yes")))))
+
+(defun bluetooth--ins-classes (props)
+  "Insert device classes from properties alist PROPS."
+  (when-let (class (cl-rest (assoc "Class" props)))
+	(let ((p-class (bluetooth--parse-class class)))
+	  (bluetooth--ins-heading "\nService and device classes\n")
+	  (--map (cl-destructuring-bind (type value) it
+			   (if (listp value)
+				   (bluetooth--ins-line type
+										(mapconcat #'identity
+												   value
+												   ", "))
+				 (bluetooth--ins-line type value)))
+			 p-class))))
+
+(defun bluetooth--ins-services (props)
+  "Insert device services from properties alist PROPS."
+  (when (cl-rest (assoc "UUIDs" props))
+	(bluetooth--ins-heading "\nServices (UUIDs)\n")
+	(mapc (lambda (id-pair)
+			(--zip-with (insert (format it other))
+						'("%36s  " "%s " "(%s)")
+						(cl-second id-pair))
+			(insert "\n"))
+		  (bluetooth--device-uuids props))))
+
+(defun bluetooth--ins-rf-info (props)
+  "Insert rf information from properties alist PROPS."
+  (let* ((rssi (cl-rest (assoc "RSSI" props)))
+		 (tx-power (cl-rest (assoc "TxPower" props)))
+		 (loss (when (and rssi tx-power) (- tx-power rssi))))
+	(--zip-with (when other
+				  (bluetooth--ins-line (cl-first it)
+									   (format (cl-second it) other)))
+				'(("RSSI" "%4d dBm") ("Tx Power" "%4d dBm")
+				  ("Path loss" "%4d dB"))
+				(list rssi tx-power loss))))
+
+(defun bluetooth--ins-mfc-info (props)
+  "Insert manufacturer information from properties alist PROPS."
+  (when-let (mf-info (cl-second (assoc "ManufacturerData" props)))
+	(bluetooth--ins-line "Manufacturer"
+						 (or (gethash (cl-first mf-info)
+									  bluetooth--manufacturer-ids)
+							 "unknown"))))
 
 (defun bluetooth-show-device-info ()
   "Show detailed information on the device at point."
   (interactive)
-  (cl-flet ((ins-heading (text)
-						 (insert (propertize text 'face
-											 'bluetooth-info-heading)))
-			(ins-attr (attr value)
-					  (insert (propertize (format "%15s" attr)
-										  'face
-										  'bluetooth-info-attribute))
-					  (insert ": " value "\n")))
-	(let ((dev-id (tabulated-list-get-id)))
-	  (when dev-id
-		(bluetooth--with-alias dev-id
-		  (with-current-buffer-window
-		   "*Bluetooth device info*" nil nil
-		   (let ((props (bluetooth--device-properties dev-id)))
-			 (ins-heading "Bluetooth device info\n\n")
-			 (ins-attr "Alias" alias)
-			 (when-let (address (cdr (assoc "Address" props)))
-			   (ins-attr "Address" address))
-			 (when-let (addr-type (cdr (assoc "AddressType" props)))
-			   (ins-attr "Address type" addr-type))
-			 (let ((rssi (cdr (assoc "RSSI" props)))
-				   (tx-power (cdr (assoc "TxPower" props))))
-			   (when rssi
-				 (ins-attr "RSSI" (format "%4d dBm" rssi)))
-			   (when tx-power
-				 (ins-attr "Tx Power" (format "%4d dBm" tx-power)))
-			   (when (and rssi tx-power)
-				 (ins-attr "Path loss" (format "%4d dB" (- tx-power rssi)))))
-			 (when-let (mf-info (cadr (assoc "ManufacturerData" props)))
-			   (ins-attr "Manufacturer" (or (gethash (car mf-info)
-													 bluetooth--manufacturer-ids)
-											"unknown")))
-			 (when-let (class (cdr (assoc "Class" props)))
-			   (let ((p-class (bluetooth--parse-class class)))
-				 (ins-heading "\nService and device classes\n")
-				 (dolist (x p-class)
-				   (insert (propertize
-							(format "%s:\n"  (car x))
-							'face 'bluetooth-info-attribute))
-				   (if (listp (cadr x))
-					   (dolist (elt (cadr x))
-						 (insert (format "%15s %s\n" "" elt)))
-					 (insert (format "%15s %s\n" "" (cadr x)))))))
-			 (when (cdr (assoc "UUIDs" props))
-			   (ins-heading "\nSerives (UUIDs)\n")
-			   (mapc (lambda (id-pair)
-					   (let ((desc (cadr id-pair)))
-						 (when (car desc)
-						   (insert (format "%36s  " (car desc))))
-						 (when (cadr desc)
-						   (insert (format "%s " (cadr desc))))
-						 (when (caddr desc)
-						   (insert (format "(%s)" (caddr desc))))
-						 (insert "\n")))
-					 (bluetooth--device-uuids props))))
-		   (special-mode)))))))
+  (when-let (device (bluetooth--device (tabulated-list-get-id)))
+	(with-current-buffer-window bluetooth-info-buffer-name nil nil
+	  (let ((props (bluetooth-device-properties device)))
+		(bluetooth--ins-heading "Bluetooth device info\n\n")
+		(mapc (lambda (it) (bluetooth--ins-attr props it))
+			   '("Alias" "Address" "AddressType" "Paired" "Trusted"
+				 "Blocked" "LegacyPairing" "Connected" "Modalias"
+				 "ServicesResolved" "WakeAllowed" "Adapter"))
+		(funcall (-juxt #'bluetooth--ins-rf-info
+						#'bluetooth--ins-mfc-info
+						#'bluetooth--ins-classes
+						#'bluetooth--ins-services)
+				 props)
+		(special-mode)))))
+
+(defun bluetooth-show-adapter-info ()
+  "Show detailed information on the (first) bluetooth adapter."
+  (interactive)
+  (let* ((adapter (cl-first (bluetooth--query-adapters)))
+		 (props (bluetooth--adapter-properties adapter)))
+	(with-current-buffer-window bluetooth-info-buffer-name nil nil
+	  (bluetooth--ins-heading "Bluetooth adapter info\n\n")
+	  (mapc (lambda (it) (bluetooth--ins-attr props it))
+			 '("Alias" "Address" "AddressType" "Powered" "Discoverable"
+			   "DiscoverableTimeout" "Pairable" "PairableTimeout"
+			   "Discovering" "Roles" "Modalias"))
+	  (bluetooth--ins-line "Adapter" (concat bluetooth--root "/"
+											 adapter))
+	  (funcall (-juxt #'bluetooth--ins-mfc-info
+					  #'bluetooth--ins-classes
+					  #'bluetooth--ins-services)
+			   props)
+	  (special-mode))))
+
+
+;;;; mode entry command
+
+;;;###autoload
+(defun bluetooth-list-devices ()
+  "Display a list of Bluetooth devices.
+This function starts Bluetooth mode which offers an interface
+offering device management functions, e.g. pairing, connecting,
+scanning the bus, displaying device info etc."
+  (interactive)
+  ;; make sure D-Bus is (made) available
+  (dbus-ping bluetooth-bluez-bus bluetooth--service bluetooth--timeout)
+  (with-current-buffer (switch-to-buffer bluetooth-buffer-name)
+	(unless (derived-mode-p 'bluetooth-mode)
+	  (erase-buffer)
+	  (setq bluetooth--device-info (make-hash-table :test #'equal))
+	  (bluetooth--initialize-device-info)
+	  (bluetooth-mode)
+	  (setq bluetooth--method-objects (bluetooth--register-agent))
+	  (cl-pushnew bluetooth--mode-info mode-line-process)
+	  (add-hook 'kill-buffer-hook #'bluetooth--cleanup nil t)
+	  (setq imenu-create-index-function #'bluetooth--create-imenu-index)
+	  (bluetooth--initialize-mode-info)
+	  (setq bluetooth--adapter-signal
+			(bluetooth--register-signal-handler)))))
 
 (provide 'bluetooth)
 
