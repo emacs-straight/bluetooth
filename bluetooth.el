@@ -271,6 +271,10 @@ This function evaluates to an alist of attribute/value pairs."
 						   (alist-get :adapter
 									  bluetooth--interfaces)))
 
+(defun bluetooth--adapter-property (adapter property)
+  "Return the value of ADAPTER's PROPERTY."
+  (cl-rest (assoc property (bluetooth--adapter-properties adapter))))
+
 (defconst bluetooth--list-format
   [("Alias" 24 t) ("Paired" 8 t) ("Connected" 11 t) ("Address" 18 t)
    ("Blocked" 9 t) ("Trusted" 9 t)]
@@ -417,8 +421,9 @@ This function only uses the first adapter reported by Bluez."
 	(mapc #'bluetooth--device-remove
 		  (hash-table-keys bluetooth--device-info))
 	(setq bluetooth--device-info nil)
-	(remove-hook tabulated-list-revert-hook #'bluetooth--update-all)
-	(cancel-timer bluetooth--update-timer)))
+	(remove-hook 'tabulated-list-revert-hook #'bluetooth--update-all)
+	(cancel-timer bluetooth--update-timer)
+	(setq bluetooth--update-timer nil)))
 
 (defun bluetooth-unload-function ()
   "Clean up when the bluetooth feature is unloaded."
@@ -4509,13 +4514,15 @@ profiles."
 
 (bluetooth-defun-method "StartDiscovery" :adapter
   "Start discovery mode."
-  (setq bluetooth--update-timer
-		(run-at-time nil bluetooth-update-interval
-					 #'bluetooth--update-print)))
+  (unless bluetooth--update-timer
+	(setq bluetooth--update-timer
+		  (run-at-time nil bluetooth-update-interval
+					   #'bluetooth--update-print))))
 
 (bluetooth-defun-method "StopDiscovery" :adapter
   "Stop discovery mode."
-  (cancel-timer bluetooth--update-timer))
+  (cancel-timer bluetooth--update-timer)
+  (setq bluetooth--update-timer nil))
 
 (bluetooth-defun-method "Pair" :device
   "Pair with device at point.")
@@ -4797,9 +4804,15 @@ scanning the bus, displaying device info etc."
 	  (bluetooth-mode)
 	  (setq bluetooth--method-objects (bluetooth--register-agent))
 	  (cl-pushnew bluetooth--mode-info mode-line-process)
-	  (add-hook 'kill-buffer-hook #'bluetooth--cleanup nil t)
+	  (add-hook 'kill-buffer-hook #'bluetooth--cleanup 0 t)
 	  (setq imenu-create-index-function #'bluetooth--create-imenu-index)
 	  (bluetooth--initialize-mode-info)
+	  (setq bluetooth--update-timer
+			(if (bluetooth--adapter-property (cl-first (bluetooth--query-adapters))
+											 "Discovering")
+				(run-at-time nil bluetooth-update-interval
+							 #'bluetooth--update-print)
+			  nil))
 	  (setq bluetooth--adapter-signal
 			(bluetooth--register-signal-handler)))))
 
